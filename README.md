@@ -7,7 +7,7 @@
 Neovim, built into your [herdr](https://herdr.dev) workspace: a persistent
 nvim sidebar one key away, with quick access to the files your agent works on.
 
-<https://github.com/user-attachments/assets/39cff292-fff9-4373-a1e5-7fa56f590c9a>
+https://github.com/user-attachments/assets/9a6092b4-6851-4e47-a4b7-d09fda1f5121
 
 ## Features
 

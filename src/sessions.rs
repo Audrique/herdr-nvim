@@ -283,7 +283,33 @@ pub(crate) struct Mined {
 /// `.entry()` alone can't distinguish a fresh insert from an existing one
 /// without an extra branch on its return value, so the presence check is
 /// done up front instead.
+#[cfg(test)]
 pub(crate) fn mine_session(agent_kind: &str, text: &str) -> Mined {
+    mine_session_at(agent_kind, text, Path::new("/"))
+}
+
+/// Normalize tool paths before reduction and Git merging. Pi's session header
+/// cwd is authoritative even if the pane has since changed directory. Older
+/// logs without a header use the caller's pane cwd.
+pub(crate) fn mine_session_at(agent_kind: &str, text: &str, cwd: &Path) -> Mined {
+    let session_cwd = if agent_kind == "pi" {
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|value| {
+                (value.get("type").and_then(Value::as_str) == Some("session"))
+                    .then(|| {
+                        value
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| crate::extract::resolve(s, cwd))
+                    })
+                    .flatten()
+            })
+    } else {
+        None
+    };
+    let cwd = session_cwd.as_deref().unwrap_or(cwd);
     let raw: Vec<RawEvent> = match agent_kind {
         "pi" => parse_session(text, &PI_DIALECT),
         "claude" => parse_session(text, &CLAUDE_DIALECT),
@@ -301,7 +327,10 @@ pub(crate) fn mine_session(agent_kind: &str, text: &str) -> Mined {
     let mut by_path: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
 
-    for event in raw {
+    for mut event in raw {
+        event.path = crate::extract::resolve(&event.path, cwd)
+            .to_string_lossy()
+            .into_owned();
         if !by_path.contains_key(&event.path) {
             order.push(event.path.clone());
         }
@@ -529,6 +558,48 @@ mod tests {
         assert!(!touch.newly_created);
         // 2026-07-22T11:08:00.000Z, verified via `date -u -r 1784718480`.
         assert_eq!(touch.last_touch_unix, Some(1784718480));
+    }
+
+    #[test]
+    fn pi_relative_paths_use_header_cwd_and_dedupe_before_reduction() {
+        let text = concat!(
+            "{\"type\":\"session\",\"cwd\":\"/repo/project\"}\n",
+            "{\"type\":\"message\",\"message\":{\"content\":[{\"type\":\"toolCall\",\"name\":\"read\",\"arguments\":{\"path\":\"src/../main.rs\"}},{\"type\":\"toolCall\",\"name\":\"edit\",\"arguments\":{\"path\":\"/repo/project/main.rs\"}}]}}\n"
+        );
+        let mined = mine_session_at("pi", text, Path::new("/wrong/pane/cwd"));
+        assert_eq!(mined.touches.len(), 1);
+        assert_eq!(
+            mined.touches[0].path,
+            crate::extract::resolve("/repo/project/main.rs", Path::new("/")).to_string_lossy()
+        );
+        assert!(mined.touches[0].was_edited);
+        assert!(!mined.touches[0].newly_created);
+    }
+
+    #[test]
+    fn pi_logs_without_header_use_pane_cwd() {
+        let text = "{\"type\":\"message\",\"message\":{\"content\":[{\"type\":\"toolCall\",\"name\":\"write\",\"arguments\":{\"path\":\"../new.rs\"}}]}}";
+        let mined = mine_session_at("pi", text, Path::new("/repo/sub"));
+        assert_eq!(
+            mined.touches[0].path,
+            crate::extract::resolve("/repo/new.rs", Path::new("/")).to_string_lossy()
+        );
+        assert!(mined.touches[0].newly_created);
+    }
+
+    #[test]
+    fn pi_home_paths_are_expanded_before_reduction() {
+        let _env = crate::test_support::TestEnv::new();
+        std::env::set_var("HOME", "/home/session-test");
+        let text = "{\"type\":\"session\",\"cwd\":\"~/project\"}\n{\"type\":\"message\",\"message\":{\"content\":[{\"type\":\"toolCall\",\"name\":\"read\",\"arguments\":{\"path\":\"src/a.rs\"}},{\"type\":\"toolCall\",\"name\":\"edit\",\"arguments\":{\"path\":\"~/project/src/a.rs\"}}]}}";
+        let mined = mine_session_at("pi", text, Path::new("/wrong"));
+        assert_eq!(mined.touches.len(), 1);
+        assert_eq!(
+            mined.touches[0].path,
+            crate::extract::resolve("/home/session-test/project/src/a.rs", Path::new("/"))
+                .to_string_lossy()
+        );
+        assert!(mined.touches[0].was_edited);
     }
 
     #[test]

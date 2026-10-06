@@ -146,17 +146,30 @@ fn parse_pane_scroll(value: &Value) -> Option<PaneScroll> {
     })
 }
 
-/// Pure: extract `result.pane.foreground_cwd` (required) plus the optional
+/// Pure: extract `result.pane.foreground_cwd` (falling back to `cwd`) plus the optional
 /// `agent_session` and `scroll` blocks from a single `pane get` response.
 /// Backs `pane_snapshot`, which folds what used to be two separate `pane get`
 /// subprocess spawns (`pane_cwd` + `agent_session`) -- profiled as a
 /// meaningful chunk of the pick-file action phase's latency -- into one.
 fn parse_pane_snapshot(value: &Value) -> Result<PaneSnapshot> {
     Ok(PaneSnapshot {
-        cwd: PathBuf::from(string_at(value, "/result/pane/foreground_cwd")?),
+        cwd: parse_pane_cwd(value)?,
         agent_session: parse_agent_session(value),
         scroll: parse_pane_scroll(value),
     })
+}
+
+fn parse_pane_cwd(value: &Value) -> Result<PathBuf> {
+    ["/result/pane/foreground_cwd", "/result/pane/cwd"]
+        .iter()
+        .find_map(|pointer| {
+            value
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .map(PathBuf::from)
+        .context("pane get response missing foreground_cwd and cwd")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,10 +475,7 @@ impl Herdr for CliHerdr {
 
     fn pane_cwd(&mut self, pane: &str) -> Result<PathBuf> {
         let value = Self::run(&args(&["pane", "get", pane]))?;
-        Ok(PathBuf::from(string_at(
-            &value,
-            "/result/pane/foreground_cwd",
-        )?))
+        parse_pane_cwd(&value)
     }
 
     fn pane_snapshot(&mut self, pane: &str) -> Result<PaneSnapshot> {
@@ -787,6 +797,23 @@ mod tests {
         assert_eq!(snapshot.cwd, PathBuf::from("/repo"));
         assert!(snapshot.agent_session.is_none());
         assert!(snapshot.scroll.is_none());
+    }
+
+    #[test]
+    fn pane_cwd_prefers_foreground_and_falls_back_for_missing_null_or_empty() {
+        for foreground in [serde_json::json!(null), serde_json::json!("")] {
+            let value = serde_json::json!({"result": {"pane": {"foreground_cwd": foreground, "cwd": "/shell"}}});
+            assert_eq!(
+                parse_pane_snapshot(&value).unwrap().cwd,
+                PathBuf::from("/shell")
+            );
+        }
+        let value = serde_json::json!({"result": {"pane": {"cwd": "/shell"}}});
+        assert_eq!(parse_pane_cwd(&value).unwrap(), PathBuf::from("/shell"));
+        let value =
+            serde_json::json!({"result": {"pane": {"foreground_cwd": "/agent", "cwd": "/shell"}}});
+        assert_eq!(parse_pane_cwd(&value).unwrap(), PathBuf::from("/agent"));
+        assert!(parse_pane_cwd(&serde_json::json!({"result": {"pane": {}}})).is_err());
     }
 
     #[test]

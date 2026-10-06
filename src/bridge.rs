@@ -70,13 +70,9 @@ fn effective_scan_lines(configured: u32, scroll: Option<herdr::PaneScroll>) -> u
 /// Selection rule for which agent pane to read.
 ///
 /// * If the currently `focused` pane is itself an agent, use it.
-/// * Otherwise prefer an agent in the *same tab* as the focused pane -- when
-///   you trigger the picker from the nvim sidebar, the agent you mean is its
-///   tab-mate, not some unrelated first agent elsewhere in the workspace (that
-///   other agent's cwd would otherwise drive the git/repo-wide file search, so
-///   picking it silently searches the wrong repo).
-/// * Otherwise fall back to the first agent pane in `workspace`.
-/// * If the workspace has no agent panes, error.
+/// * Otherwise use a lone agent in the same tab, or a lone workspace agent
+///   when the tab has none.
+/// * Refuse ambiguity rather than silently searching another agent's repo.
 pub fn target_agent_pane(
     h: &mut dyn Herdr,
     workspace: &str,
@@ -87,14 +83,19 @@ pub fn target_agent_pane(
     if let Some(agent) = agents.iter().find(|agent| agent.pane_id == focused) {
         return Ok(agent.pane_id.clone());
     }
-    if let Some(agent) = agents.iter().find(|agent| agent.tab_id == tab) {
-        return Ok(agent.pane_id.clone());
+    let in_tab: Vec<_> = agents.iter().filter(|agent| agent.tab_id == tab).collect();
+    match in_tab.as_slice() {
+        [agent] => return Ok(agent.pane_id.clone()),
+        [] => {}
+        _ => bail!(
+            "ambiguous agent target in tab {tab}; invoke pick-file from the intended agent pane"
+        ),
     }
-    agents
-        .into_iter()
-        .next()
-        .map(|agent| agent.pane_id)
-        .with_context(|| format!("no agent panes found in workspace {workspace}"))
+    match agents.as_slice() {
+        [agent] => Ok(agent.pane_id.clone()),
+        [] => bail!("no agent panes found in workspace {workspace}"),
+        _ => bail!("ambiguous agent target in workspace {workspace}; invoke pick-file from the intended agent pane"),
+    }
 }
 
 /// Phase 1: read the target agent pane, gather candidates from the three
@@ -159,8 +160,8 @@ fn gather_candidates(
     let agent_name = agent_session.map(|s| s.agent.as_str()).unwrap_or("");
     let mined = session_text
         .as_deref()
-        .map(|text| sessions::mine_session(agent_name, text))
-        .unwrap_or_else(|| sessions::mine_session("", ""));
+        .map(|text| sessions::mine_session_at(agent_name, text, cwd))
+        .unwrap_or_else(|| sessions::mine_session_at("", "", cwd));
 
     let toplevel = gitscan::toplevel(cwd);
     let git_dirty = toplevel
@@ -338,14 +339,18 @@ fn open_in_nvim(
 /// Focus the sidebar pane so the user lands in nvim. Best-effort: the file is
 /// already loaded in the daemon regardless, so a focus failure is non-fatal.
 fn focus_pane(pane: &str) {
-    let result = Command::new("herdr")
-        .args(["agent", "focus", pane])
-        .status();
+    let result = sidebar_focus_command(pane).status();
     match result {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!("herdr-nvim: could not focus sidebar pane {pane} (exit {status})"),
         Err(error) => eprintln!("herdr-nvim: could not focus sidebar pane {pane}: {error}"),
     }
+}
+
+fn sidebar_focus_command(pane: &str) -> Command {
+    let mut command = Command::new("herdr");
+    command.args(["plugin", "pane", "focus", pane]);
+    command
 }
 
 /// Open the picker as a floating popup pane, passing the handoff path via the
@@ -473,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn non_agent_focus_falls_back_to_first_agent_when_no_tab_match() {
+    fn non_agent_focus_refuses_ambiguous_workspace_when_no_tab_match() {
         let mut h = MockHerdr {
             agents_results: VecDeque::from([Ok(vec![
                 agent("wA:p1", "wA:t3", false),
@@ -481,7 +486,33 @@ mod tests {
             ])]),
             ..Default::default()
         };
-        // No agent in the focused pane's tab (wA:t9), so the first agent wins.
+        assert!(target_agent_pane(&mut h, "wA", "wA:t9", "wA:p9")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn non_agent_focus_refuses_ambiguous_tab() {
+        let mut h = MockHerdr {
+            agents_results: VecDeque::from([Ok(vec![
+                agent("wA:p1", "wA:t1", false),
+                agent("wA:p2", "wA:t1", false),
+            ])]),
+            ..Default::default()
+        };
+        assert!(target_agent_pane(&mut h, "wA", "wA:t1", "wA:sidebar")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn lone_workspace_agent_is_used_without_tab_match() {
+        let mut h = MockHerdr {
+            agents_results: VecDeque::from([Ok(vec![agent("wA:p1", "wA:t3", false)])]),
+            ..Default::default()
+        };
         assert_eq!(
             target_agent_pane(&mut h, "wA", "wA:t9", "wA:p9").unwrap(),
             "wA:p1"
@@ -543,6 +574,67 @@ mod tests {
     fn no_finish_argument_is_phase_one() {
         let args = ["herdr-nvim", "pick-file"].into_iter().map(String::from);
         assert!(finish_handoff_path(args).is_none());
+    }
+
+    #[test]
+    fn sidebar_focus_uses_plugin_pane_not_agent_command() {
+        let command = sidebar_focus_command("wA:sidebar");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["plugin", "pane", "focus", "wA:sidebar"]
+        );
+    }
+
+    #[test]
+    fn pi_relative_session_paths_merge_with_git_as_absolute_candidates() {
+        let test_env = crate::test_support::TestEnv::new();
+        let repo = test_env.dir.join("repo");
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let file = repo.join("main.rs");
+        std::fs::write(&file, "old\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "main.rs"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(&file, "new\n").unwrap();
+        let text = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","cwd":repo}),
+            serde_json::json!({"type":"message","message":{"content":[{"type":"toolCall","name":"edit","arguments":{"path":"./sub/../main.rs"}}]}})
+        );
+        let log = test_env.dir.join("session.jsonl");
+        std::fs::write(&log, text).unwrap();
+        let session = herdr::AgentSession {
+            agent: "pi".into(),
+            kind: "path".into(),
+            value: log.to_string_lossy().into_owned(),
+        };
+        let candidates = gather_candidates(Some(&session), "", &repo.join("sub"), &Path::is_file);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "relative session and Git paths must not produce duplicates"
+        );
+        assert_eq!(candidates[0].path, file.to_string_lossy());
+        assert!(Path::new(&candidates[0].path).is_absolute());
+        assert!(candidates[0].is_edit);
+        assert_eq!(candidates[0].diff_stat, Some((1, 1)));
     }
 
     #[test]

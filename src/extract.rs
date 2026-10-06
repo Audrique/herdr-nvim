@@ -136,9 +136,10 @@ pub(crate) fn parse_token(tok: &str) -> Option<(&str, Option<u32>)> {
 
 /// Resolve a path token to an absolute, lexically-normalized [`PathBuf`].
 pub(crate) fn resolve(path: &str, cwd: &Path) -> PathBuf {
-    let expanded = if let Some(rest) = path.strip_prefix('~') {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(format!("{home}{rest}"))
+    let expanded = if path == "~" || path.starts_with("~/") {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or("")))
+            .unwrap_or_else(|| cwd.join(path))
     } else if Path::new(path).is_absolute() || path.starts_with('/') {
         PathBuf::from(path)
     } else {
@@ -248,6 +249,7 @@ mod tests {
 
     #[test]
     fn tilde_expands() {
+        let _env = crate::test_support::TestEnv::new();
         std::env::set_var("HOME", "/home/u");
         let c = extract("see ~/notes.md", Path::new("/"), &always);
         assert_eq!(c[0].path, normalized("/home/u/notes.md"));

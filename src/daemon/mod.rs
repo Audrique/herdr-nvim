@@ -54,7 +54,10 @@ pub fn ensure_daemon(
     cwd: &Path,
 ) -> Result<PathBuf> {
     let socket = socket_path(tab);
-    if daemon_healthy(&socket, &config.sidebar) {
+    if remote_expr(&socket, "1+1", &config.sidebar).as_deref() == Some("2") {
+        // A responsive but broken/unready plugin is NOT a dead socket. Never
+        // unlink it or start a competing daemon; surface its bootstrap error.
+        wait_daemon_ready(tab, &socket, &config.sidebar)?;
         // Also (re)register an already-running daemon, so one spawned before
         // the Windows marker existed still becomes discoverable.
         #[cfg(windows)]
@@ -79,14 +82,19 @@ pub fn ensure_daemon(
     #[cfg(windows)]
     registry::register_daemon(tab)?;
 
+    wait_daemon_ready(tab, &socket, &config.sidebar)?;
+    Ok(socket)
+}
+
+fn wait_daemon_ready(tab: &str, socket: &Path, sidebar: &Sidebar) -> Result<()> {
     let deadline = Instant::now() + HEALTH_POLL_TIMEOUT;
     loop {
-        if daemon_healthy(&socket, &config.sidebar) {
-            return Ok(socket);
+        if daemon_healthy(socket, sidebar)? {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             bail!(
-                "nvim daemon for tab {tab} did not become healthy within {}s",
+                "nvim daemon for tab {tab} did not become plugin-ready within {}s",
                 HEALTH_POLL_TIMEOUT.as_secs()
             );
         }
@@ -107,11 +115,14 @@ fn spawn_daemon(
     // drop our appended path before VimEnter fires. So the VimEnter callback
     // re-appends the plugin root to rtp
     // *after* the user's config has loaded, then requires the plugin. The whole
-    // thing stays wrapped in `pcall` so a missing/broken plugin never crashes
-    // the daemon.
+    // pcall records errors for the readiness probe instead of swallowing them.
+    // bootstrap() preserves any setup already performed by the user's config.
     let vim_enter = format!(
         "lua vim.api.nvim_create_autocmd('VimEnter',{{callback=function() \
-         pcall(function() vim.opt.rtp:append({root:?}); require('herdr-nvim').setup() end) end}})",
+         local ok,err=pcall(function() vim.opt.rtp:append({root:?}); \
+         assert(require('herdr-nvim').bootstrap(),'plugin readiness check failed') end); \
+         if not ok then vim.g.herdr_nvim_bootstrap_error=tostring(err); \
+         vim.notify('herdr-nvim bootstrap failed: '..tostring(err),vim.log.levels.ERROR) end end}})",
         root = plugin_root.display().to_string()
     );
     // Plumb the tab's identity into the daemon explicitly. The daemon is
@@ -131,7 +142,10 @@ fn spawn_daemon(
         .arg("--listen")
         .arg(socket)
         .arg("--cmd")
-        .arg(format!("set rtp+={}", plugin_root.display()))
+        .arg(format!(
+            "lua vim.opt.rtp:append({:?})",
+            plugin_root.display().to_string()
+        ))
         .arg("--cmd")
         .arg(&vim_enter)
         .env("HERDR_WORKSPACE_ID", &workspace)
@@ -185,8 +199,18 @@ pub(crate) fn detach_command(command: &mut Command) {
     }
 }
 
-fn daemon_healthy(socket: &Path, sidebar: &Sidebar) -> bool {
-    remote_expr(socket, "1+1", sidebar).as_deref() == Some("2")
+fn daemon_healthy(socket: &Path, sidebar: &Sidebar) -> Result<bool> {
+    // Pure readiness query: no setup(), option changes or keymap resets.
+    const EXPR: &str = "luaeval(\"vim.json.encode((function() local err=vim.g.herdr_nvim_bootstrap_error; if err then return {error=err} end; local m=package.loaded['herdr-nvim']; return {ready=m~=nil and type(m.ready)=='function' and m.ready() or false} end)())\")";
+    let Some(raw) = remote_expr(socket, EXPR, sidebar) else {
+        return Ok(false);
+    };
+    let status: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid nvim plugin readiness response: {raw}"))?;
+    if let Some(error) = status.get("error").and_then(serde_json::Value::as_str) {
+        bail!("herdr-nvim plugin bootstrap failed: {error}");
+    }
+    Ok(status.get("ready").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 /// Evaluate a vimscript expression on the daemon via `--remote-expr`, returning
@@ -365,6 +389,120 @@ mod tests {
             daemon.eval("getpid()"),
             daemon.pid.to_string(),
             "second ensure_daemon must reuse the daemon, not spawn a new one"
+        );
+    }
+
+    #[test]
+    fn daemon_bootstrap_preserves_user_setup_and_maps() {
+        if !nvim_available() {
+            return;
+        }
+        let test_env = TestEnv::new();
+        let config_dir = test_env.dir.join("xdg-config").join("hn-test");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("init.lua"),
+            concat!(
+            "require('herdr-nvim').setup({keymaps=false,prefix='CUSTOM',clear_after_send=false})\n",
+            "vim.keymap.set('n','CUSTOMs',\"<cmd>echo 'draft only'<cr>\")\n"
+        ),
+        )
+        .unwrap();
+        let config = Config {
+            sidebar: Sidebar {
+                nvim_env: vec!["NVIM_APPNAME=hn-test".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let socket = ensure_daemon("wP:t1", &root, &config, &root).unwrap();
+        let pid = remote_expr(&socket, "getpid()", &config.sidebar)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let daemon = TestDaemon {
+            tab: TabId::new("wP:t1"),
+            socket,
+            pid,
+        };
+        assert!(daemon_healthy(&daemon.socket, &config.sidebar).unwrap());
+        assert_eq!(
+            daemon.eval("luaeval(\"require('herdr-nvim').config.prefix\")"),
+            "CUSTOM"
+        );
+        assert_eq!(
+            daemon.eval("luaeval(\"require('herdr-nvim').config.keymaps\")"),
+            "false"
+        );
+        assert_eq!(
+            daemon.eval("luaeval(\"require('herdr-nvim').config.clear_after_send\")"),
+            "false"
+        );
+        assert!(daemon.eval("maparg('CUSTOMs','n')").contains("draft only"));
+        assert_eq!(daemon.eval("maparg('CUSTOMS','n')"), "");
+        ensure_daemon("wP:t1", &root, &config, &root).unwrap();
+        assert_eq!(daemon.eval("getpid()"), pid.to_string());
+        assert_eq!(
+            daemon.eval("luaeval(\"require('herdr-nvim').config.prefix\")"),
+            "CUSTOM"
+        );
+    }
+
+    #[test]
+    fn daemon_readiness_exposes_bootstrap_errors_without_replacing_live_socket() {
+        if !nvim_available() {
+            return;
+        }
+        let test_env = TestEnv::new();
+        let config_dir = test_env.dir.join("xdg-config").join("hn-broken");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("init.lua"),
+            "package.preload['herdr-nvim']=function() error('test bootstrap failure') end\n",
+        )
+        .unwrap();
+        let config = Config {
+            sidebar: Sidebar {
+                nvim_env: vec!["NVIM_APPNAME=hn-broken".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let socket = socket_path("wE:t1");
+        #[cfg(not(windows))]
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        spawn_daemon("wE:t1", &socket, &root, &config.sidebar, &root).unwrap();
+        // The failing bootstrap still leaves a responsive daemon; capture its
+        // pid in the test guard before asserting anything so it cannot leak.
+        let deadline = Instant::now() + HEALTH_POLL_TIMEOUT;
+        let pid = loop {
+            if let Some(pid) = remote_expr(&socket, "getpid()", &config.sidebar) {
+                break pid.parse().unwrap();
+            }
+            assert!(Instant::now() < deadline, "test daemon did not answer");
+            sleep(HEALTH_POLL_INTERVAL);
+        };
+        let daemon = TestDaemon {
+            tab: TabId::new("wE:t1"),
+            socket,
+            pid,
+        };
+        let error = wait_daemon_ready("wE:t1", &daemon.socket, &config.sidebar).unwrap_err();
+        assert!(
+            error.to_string().contains("test bootstrap failure"),
+            "{error}"
+        );
+        let error = ensure_daemon("wE:t1", &root, &config, &root).unwrap_err();
+        assert!(
+            error.to_string().contains("test bootstrap failure"),
+            "{error}"
+        );
+        assert_eq!(
+            daemon.eval("getpid()"),
+            pid.to_string(),
+            "a broken plugin must not replace a live daemon"
         );
     }
 

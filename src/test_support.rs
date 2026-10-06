@@ -24,10 +24,11 @@ use crate::{
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const VARS: [&str; 3] = [
+const VARS: [&str; 4] = [
     "HERDR_NVIM_RUNTIME_DIR",
     "HERDR_NVIM_STATE_DIR",
     "XDG_CONFIG_HOME",
+    "HOME",
 ];
 
 /// Points the runtime dir (`<dir>/runtime`, not created up front), the state

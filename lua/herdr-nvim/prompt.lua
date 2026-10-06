@@ -5,14 +5,23 @@ function M.format(items, opts)
   local header = "Code review comments from my editor"
   if opts.header_context then header = header .. " (" .. opts.header_context .. ")" end
   local lines = { header .. ":", "" }
+  local normalized_tabs = false
   for i, item in ipairs(items) do
     local c = item.comment
     table.insert(lines, string.format("%d. %s", i, M.location(c, opts.cwd)))
     for j = 1, math.min(3, #(item.snippet or {})) do
-      table.insert(lines, "   > " .. item.snippet[j])
+      -- Render safely without changing the snippet table, buffer or file.
+      -- Only code excerpts are normalized: comment/path/ref tabs still reach
+      -- dispatch's actionable refusal instead of being silently rewritten.
+      local rendered, count = item.snippet[j]:gsub("\t", "    ")
+      normalized_tabs = normalized_tabs or count > 0
+      table.insert(lines, "   > " .. rendered)
     end
     table.insert(lines, "   Comment: " .. c.text)
     table.insert(lines, "")
+  end
+  if normalized_tabs then
+    table.insert(lines, 2, "Note: snippet tabs shown as 4 spaces (display only); saved files remain authoritative.")
   end
   table.insert(lines, "Please address each comment. Reply with what you changed per item.")
   return table.concat(lines, "\n")

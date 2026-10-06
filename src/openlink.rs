@@ -282,6 +282,7 @@ mod tests {
 
     #[test]
     fn tilde_path_expands_via_home_before_exists_check() {
+        let _env = crate::test_support::TestEnv::new();
         env::set_var("HOME", "/home/u");
         let exists = |p: &Path| p == Path::new("/home/u/notes.md");
         let toplevel = |_: &Path| panic!("git_toplevel should not be called for ~ paths");

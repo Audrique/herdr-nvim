@@ -3,6 +3,7 @@
 [![CI](https://github.com/ChmaraX/herdr-nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/ChmaraX/herdr-nvim/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ChmaraX/herdr-nvim)](https://github.com/ChmaraX/herdr-nvim/releases)
 [![License](https://img.shields.io/github/license/ChmaraX/herdr-nvim)](LICENSE)
+[![Nix CI](https://github.com/Audrique/herdr-nvim/actions/workflows/nix.yml/badge.svg)](https://github.com/Audrique/herdr-nvim/actions/workflows/nix.yml)
 
 Neovim, built into your [herdr](https://herdr.dev) workspace: a persistent
 nvim sidebar one key away, with quick access to the files your agent works on.
@@ -28,7 +29,25 @@ https://github.com/user-attachments/assets/9a6092b4-6851-4e47-a4b7-d09fda1f5121
 
 nvim ≥ 0.10 · herdr ≥ 0.7.5 · runs inside a herdr session
 
+This fork's Nix and guarded-draft integration is verified with Herdr 0.8.2 and
+Neovim 0.12.4; run its checks for other versions you intend to use.
+
 ## Install
+
+### Nix / Home Manager
+
+This fork packages the binary and matching Lua plugin from one flake pin, with
+Home Manager registration, checks and a development shell. No upstream binary
+download or installer runs during activation. See [Nix integration](doc/nix.md)
+for the module, lazy.nvim configuration and save-before-handoff workflow.
+
+```sh
+nix develop   # Cargo, rustfmt, Clippy, Neovim, Just and Nix tooling
+nix flake check
+nix build
+```
+
+### Other platforms / plugin managers
 
 Both halves come from this repo:
 
@@ -124,8 +143,9 @@ Each row shows:
 - a relative touched-age (`2m`, `3h`)
 
 If you start the picker from a non-agent pane (for example, the sidebar
-itself), it reads the agent in the same tab. So it searches the repo that
-you see.
+itself), it uses the lone agent in that tab, or a lone workspace agent when
+the tab has none. Ambiguous targets are refused: invoke the picker from the
+intended agent pane instead of silently searching another agent's repo.
 
 The default view shows the latest `max_files` entries (20). A typed query is
 uncapped.
@@ -165,6 +185,12 @@ only appears when two or more agents could plausibly be meant.
 
 `<leader>ai` (or `:Herdr ref`) drops just `path:12-20` into the agent's input,
 so you can mention code mid-sentence. It never submits.
+
+Save explicitly before handing work to the agent: references identify saved
+files/ranges, not unsaved buffer snapshots. Draft delivery rechecks the agent
+and pane identity/state and refuses blocked/unknown targets and unsafe controls.
+It adds no Enter and does not retry automatically. See [transport limitations](doc/nix.md#pairing-review-and-lifecycle)
+before relying on multiline drafts or retrying a timeout.
 
 Comments are ephemeral by design: in-memory only, extmark-tracked (they follow
 your edits), cleared after a successful send. The sent prompt includes each
@@ -229,6 +255,6 @@ did not start. Make sure that `sidebar.nvim_bin` points at a working nvim ≥
 ## Tests
 
 ```sh
-just ci    # cargo fmt + cargo test + headless Lua suite
+just ci    # cargo fmt + locked cargo test + headless Lua suite
+just nix-check  # packaged binary, Lua, formatting and Home Manager checks
 ```
-test

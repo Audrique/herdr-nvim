@@ -98,5 +98,36 @@ end)
 
 T.test("agents: display row leads with agent kind", function()
   local row = agents.display({ kind = "pi", title = "π - a", status = "idle", cwd = "/x/y/proj" })
-  T.eq(row, "pi · idle · proj")
+  T.eq(row, "pi · idle · /x/y/proj · ? · ?")
+end)
+
+T.test("agents: foreground cwd preferred, null/missing falls back, session identity retained", function()
+  local previous = vim.env.HERDR_WORKSPACE_ID
+  vim.env.HERDR_WORKSPACE_ID = nil
+  local session = { agent = "pi", kind = "path", value = "/real-session.jsonl" }
+  local list = agents.list(fake_exec(vim.json.encode({ result = { agents = {
+    { pane_id = "wA:p1", tab_id = "wA:t1", terminal_id = "term-1", workspace_id = "wA", agent = "pi",
+      name = "review", cwd = "/shell", foreground_cwd = "/work/proj", agent_session = session },
+    { pane_id = "wA:p2", tab_id = "wA:t2", agent = "pi", cwd = "/other/proj", foreground_cwd = vim.NIL },
+    { pane_id = "wA:p3", tab_id = "wA:t3", agent = "pi", cwd = "/fallback", foreground_cwd = "" },
+    { pane_id = "wA:shell", tab_id = "wA:t1", cwd = "/shell" },
+  } } })))
+  vim.env.HERDR_WORKSPACE_ID = previous
+  T.eq(#list, 3, "bare panes are not agent targets")
+  local by_pane = {}
+  for _, a in ipairs(list) do by_pane[a.pane_id] = a end
+  T.eq(by_pane["wA:p1"].cwd, "/work/proj")
+  T.eq(by_pane["wA:p1"].name, "review")
+  T.eq(by_pane["wA:p1"].title, "review")
+  T.eq(by_pane["wA:p1"].terminal_id, "term-1")
+  T.eq(by_pane["wA:p1"].agent_session, session)
+  T.eq(by_pane["wA:p2"].cwd, "/other/proj")
+  T.eq(by_pane["wA:p3"].cwd, "/fallback")
+end)
+
+T.test("agents: same-kind same-basename targets remain distinguishable", function()
+  local a = { kind = "pi", name = "review", status = "idle", cwd = "/one/proj", pane_id = "wA:p1", tab_id = "wA:t1" }
+  local b = { kind = "pi", name = "code", status = "idle", cwd = "/two/proj", pane_id = "wA:p2", tab_id = "wA:t2" }
+  T.eq(agents.display(a), "pi (review) · idle · /one/proj · wA:t1 · wA:p1")
+  T.eq(agents.display(b), "pi (code) · idle · /two/proj · wA:t2 · wA:p2")
 end)

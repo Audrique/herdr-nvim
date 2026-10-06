@@ -32,6 +32,19 @@ function M.setup(config)
     map("x", p .. "i", function() M.ref_selection() end, "herdr-nvim: reference selection at agent cursor")
     map("n", p .. "i", function() M.ref_line() end, "herdr-nvim: reference line at agent cursor")
   end
+  M._setup_done = true
+end
+
+-- Daemon bootstrap must not re-run setup after the user's config: that would
+-- add default maps or reset a custom prefix/options on every health probe.
+function M.bootstrap()
+  if not M._setup_done then M.setup() end
+  return M.ready()
+end
+
+function M.ready()
+  return M._setup_done == true and vim.fn.exists(":Herdr") == 2 and
+    type(M.send_all) == "function" and type(dispatch.send) == "function"
 end
 
 -- Range primitive behind comment_line(), comment_selection(), and :Herdr comment.
@@ -115,7 +128,8 @@ local function deliver_to_agent(build_payload, opts, on_sent)
       vim.notify("herdr-nvim: " .. agents.display(agent) .. " is working — sending anyway", vim.log.levels.WARN)
     end
     local payload = build_payload(agent)
-    local ok, derr = dispatch.send(agent.pane_id, payload, opts)
+    local send_opts = vim.tbl_extend("force", opts or {}, { agent = agent })
+    local ok, derr = dispatch.send(agent.pane_id, payload, send_opts)
     if not ok then
       vim.notify("herdr-nvim: " .. derr, vim.log.levels.ERROR)
       return

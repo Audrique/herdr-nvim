@@ -10,6 +10,30 @@ T.test("init: setup creates guarded keymaps", function()
   vim.keymap.del("n", " ac")
 end)
 
+T.test("init: bootstrap/readiness preserves user options and maps without repeating setup", function()
+  local previous = vim.deepcopy(hn.config)
+  hn.setup({ keymaps = false, prefix = " zz", clear_after_send = false })
+  vim.keymap.set("n", " zzs", "<cmd>echo 'draft only'<cr>")
+  local setup = hn.setup
+  hn.setup = function() error("bootstrap must not repeat configured setup") end
+  T.ok(hn.bootstrap())
+  T.ok(hn.ready())
+  hn.setup = setup
+  T.eq(hn.config, { keymaps = false, prefix = " zz", clear_after_send = false })
+  T.ok(vim.fn.maparg(" zzs", "n"):find("draft only", 1, true))
+  T.eq(vim.fn.maparg(" zzS", "n"), "", "bootstrap must not insert submit mapping")
+  vim.keymap.del("n", " zzs")
+  hn.config = previous
+end)
+
+T.test("init: readiness detects a missing command without mutating setup", function()
+  vim.api.nvim_del_user_command("Herdr")
+  T.eq(hn.ready(), false)
+  T.eq(vim.fn.exists(":Herdr"), 0)
+  require("herdr-nvim.commands").register()
+  T.ok(hn.ready())
+end)
+
 T.test("init: comment_line adds a decorated comment via stubbed input", function()
   comments.clear()
   local ui = require("herdr-nvim.ui")
@@ -114,6 +138,7 @@ T.test("init: send_all formats, dispatches, clears", function()
   T.ok(sent[2]:find("1. hn-send.lua:1\n", 1, true), "path shortened against the agent's cwd")
   T.ok(sent[2]:find("> alpha", 1, true))
   T.eq(sent[3].submit, false)
+  T.eq(sent[3].agent.pane_id, "wZ:p9", "selection identity must reach dispatch for revalidation")
   T.eq(comments.list(), {}, "clear_after_send default clears comments")
 end)
 

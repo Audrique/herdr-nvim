@@ -9,19 +9,25 @@ function M.list(exec)
   end
   local ok, decoded = pcall(vim.json.decode, r.stdout)
   if not ok or type(decoded) ~= "table" then return nil, "herdr agent list: unparseable JSON" end
-  local raw = (decoded.result or {}).agents or {}
+  local raw = (decoded.result or {}).agents
+  if type(raw) ~= "table" then return nil, "herdr agent list: missing agents" end
+  local function nonempty(s) return type(s) == "string" and s ~= "" and s or nil end
   local out = {}
   local here = vim.env.HERDR_WORKSPACE_ID
   for _, a in ipairs(raw) do
-    if not here or a.workspace_id == here then
+    if nonempty(a.agent) and (not here or a.workspace_id == here) then
       table.insert(out, {
         pane_id = a.pane_id,
+        terminal_id = a.terminal_id,
         workspace_id = a.workspace_id,
         tab_id = a.tab_id,
-        kind = a.agent or "unknown",
+        name = nonempty(a.name),
+        kind = a.agent,
         status = a.agent_status or "unknown",
-        cwd = a.cwd or "",
-        title = a.terminal_title or a.agent or "agent",
+        cwd = nonempty(a.foreground_cwd) or nonempty(a.cwd) or "",
+        title = nonempty(a.name) or nonempty(a.title) or nonempty(a.terminal_title) or a.agent,
+        agent_session = type(a.agent_session) == "table" and vim.deepcopy(a.agent_session) or nil,
+        launch_pending = a.launch_pending == true,
       })
     end
   end
@@ -49,11 +55,11 @@ function M.resolve(list)
 end
 
 function M.display(agent)
-  local tail = vim.fn.fnamemodify(agent.cwd, ":t")
-  -- Lead with the agent kind (pi/claude/codex…) — the actual agent identity —
-  -- then its state and where it's running. (The terminal title tended to just
-  -- repeat the workspace/repo name shown by the cwd tail.)
-  return string.format("%s · %s · %s", agent.kind, agent.status, tail)
+  -- Keep full cwd and pane/tab identity: multiple Pi agents can share a repo
+  -- basename, or even the exact same cwd, without being interchangeable.
+  local identity = agent.name and (agent.kind .. " (" .. agent.name .. ")") or agent.kind
+  return string.format("%s · %s · %s · %s · %s", identity, agent.status,
+    agent.cwd or "", agent.tab_id or "?", agent.pane_id or "?")
 end
 
 return M
